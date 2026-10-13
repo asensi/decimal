@@ -1666,13 +1666,13 @@ BOOST_DECIMAL_CUDA_CONSTEXPR auto operator+(const decimal64_t lhs, const decimal
     }
     #endif
 
-    // Two fast paths under default rounding, gated by user-facing exp_diff:
+    // Two fast paths, gated by user-facing exp_diff (path 2 in each mode):
     //   1. exp_diff > 36: slow path would return dominant operand unchanged; skip
     //      to_components/expand_significand and return it directly.
     //   2. exp_diff <= 3: aligned_add_kernel can do the whole add in uint64 (max_sig
     //      16 digits * 10^3 = 19 digits < 2^64); skip to_components/expand_significand
     //      and the add_impl dispatch entirely.
-    // The 4..36 band falls through to the existing slow path. Both fast paths
+    // The 4..36 band goes to add_impl, which has a band kernel. Both fast paths
     // require both operands to be non-zero: zero short-circuit logic
     // (preferred-quantum result exponent, sign-of-opposite-sign-zeros) lives in
     // add_impl and is not duplicated here.
@@ -1700,6 +1700,13 @@ BOOST_DECIMAL_CUDA_CONSTEXPR auto operator+(const decimal64_t lhs, const decimal
                         return lhs_exp > rhs_exp ? lhs : rhs;
                     }
                     return detail::aligned_add_kernel<decimal64_t, std::uint64_t>(
+                        lhs_sig, rhs_sig, lhs_exp, rhs_exp, static_cast<unsigned>(exp_diff),
+                        lhs.isneg(), rhs.isneg());
+                }
+                // The other modes use the same kernel out of line
+                if (exp_diff <= 3)
+                {
+                    return detail::aligned_add_in_mode<decimal64_t, std::uint64_t>(
                         lhs_sig, rhs_sig, lhs_exp, rhs_exp, static_cast<unsigned>(exp_diff),
                         lhs.isneg(), rhs.isneg());
                 }
@@ -1798,6 +1805,13 @@ BOOST_DECIMAL_CUDA_CONSTEXPR auto operator-(const decimal64_t lhs, const decimal
                         return lhs_exp > rhs_exp ? lhs : -rhs;
                     }
                     return detail::aligned_add_kernel<decimal64_t, std::uint64_t>(
+                        lhs_sig, rhs_sig, lhs_exp, rhs_exp, static_cast<unsigned>(exp_diff),
+                        lhs.isneg(), !rhs.isneg());
+                }
+                // The other modes use the same kernel out of line
+                if (exp_diff <= 3)
+                {
+                    return detail::aligned_add_in_mode<decimal64_t, std::uint64_t>(
                         lhs_sig, rhs_sig, lhs_exp, rhs_exp, static_cast<unsigned>(exp_diff),
                         lhs.isneg(), !rhs.isneg());
                 }

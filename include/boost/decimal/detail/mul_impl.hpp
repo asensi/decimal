@@ -25,46 +25,45 @@ namespace detail {
 
 namespace impl {
 
-// Wide-product shrink + round-half-to-even + pack helpers used by the IEEE
-// finite multiplication path under default rounding (fe_dec_to_nearest).
+// Wide-product shrink + rounding + pack helpers used by the IEEE finite
+// multiplication path.
 //
 // After multiplying two precision-p significands (both expanded to full
 // precision), the wide product has either 2p-1 or 2p digits. We shrink to
 // exactly p digits by branching on the threshold 10^(2p-1), then dividing by
-// 10^(p-1) or 10^p with a round-half-to-even rule and a carry handler for the
+// 10^(p-1) or 10^p in the rounding mode, with a carry handler for the
 // rare q == 10^p case. Finally pack_in_range emits the IEEE bit pattern via
 // direct_pack_d* when the biased exponent is in range, falling back to the
 // constructor for overflow/underflow paths.
 //
 // Caller guarantees that both operand significands are non-zero (zero needs
 // the constructor's cohort-canonicalization path), at full precision p, and
-// that the active rounding mode is fe_dec_to_nearest. Non-default rounding
-// modes go through the constructor path which honors fenv_round dispatch.
+// that round is the active rounding mode. In the directed modes, the callers
+// use the out-of-line helpers below.
 
 // uint64 product -> decimal{32,fast32}_t. Product spans [10^12, ~10^14).
 template <typename ReturnType, typename ExpType>
 BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u64(
-    std::uint_fast64_t product, ExpType result_exp, bool result_sign) noexcept -> ReturnType
+    std::uint_fast64_t product, ExpType result_exp, bool result_sign,
+    const rounding_mode round = rounding_mode::fe_dec_to_nearest) noexcept -> ReturnType
 {
-    int extra {6};
-    if (product >= UINT64_C(10000000000000)) // 10^13
-    {
-        extra = 7;
-    }
-
-    const auto pow_extra {detail::pow10<std::uint64_t>(static_cast<std::uint64_t>(extra))};
-    auto q {product / pow_extra};
+    // Divide by both constants and select, as a division by a variable is slow
+    constexpr auto pow6 {detail::pow10<std::uint64_t>(UINT64_C(6))};
+    constexpr auto pow7 {detail::pow10<std::uint64_t>(UINT64_C(7))};
+    const bool long_product {product >= detail::pow10<std::uint64_t>(UINT64_C(13))};
+    int extra {long_product ? 7 : 6};
+    const auto pow_extra {long_product ? pow7 : pow6};
+    auto q {long_product ? product / pow7 : product / pow6};
     const auto r {product - q * pow_extra};
     const auto half {pow_extra >> 1};
 
-    if (r > half || (r == half && (q & UINT64_C(1)) != 0U))
+    const bool round_up {round == rounding_mode::fe_dec_to_nearest ? r + (q & UINT64_C(1)) > half :
+                                                                     detail::steps_up_in_mode(round, result_sign, r != 0U, r >= half)};
+    q += static_cast<unsigned>(round_up);
+    if (BOOST_DECIMAL_UNLIKELY(q == pow7))
     {
-        ++q;
-        if (BOOST_DECIMAL_UNLIKELY(q == UINT64_C(10000000))) // 10^7
-        {
-            q = UINT64_C(1000000); // 10^6
-            ++extra;
-        }
+        q = pow6;
+        ++extra;
     }
 
     return detail::pack_in_range<ReturnType>(static_cast<std::uint32_t>(q),
@@ -75,7 +74,8 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u64(
 // uint128 product -> decimal{64,fast64}_t. Product spans [10^30, ~10^32).
 template <typename ReturnType, typename ExpType>
 BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u128(
-    int128::uint128_t product, ExpType result_exp, bool result_sign) noexcept -> ReturnType
+    int128::uint128_t product, ExpType result_exp, bool result_sign,
+    const rounding_mode round = rounding_mode::fe_dec_to_nearest) noexcept -> ReturnType
 {
     constexpr auto threshold {detail::pow10<int128::uint128_t>(int128::uint128_t{UINT64_C(31)})};
 
@@ -94,22 +94,20 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u128(
 
     const auto pow_extra {detail::pow10<int128::uint128_t>(int128::uint128_t{static_cast<std::uint64_t>(extra)})};
     const auto dr {detail::impl::divmod_pow10_dispatch(product, extra, pow_extra)};
-    auto q {dr.quotient};
+    auto q {dr.quotient.low};
     const auto r {dr.remainder};
     const auto half {pow_extra >> 1};
 
-    if (r > half || (r == half && (q.low & UINT64_C(1)) != 0U))
+    const bool round_up {round == rounding_mode::fe_dec_to_nearest ? r + (q & UINT64_C(1)) > half :
+                                                                     detail::steps_up_in_mode(round, result_sign, r != 0U, r >= half)};
+    q += static_cast<unsigned>(round_up);
+    if (BOOST_DECIMAL_UNLIKELY(q == UINT64_C(10000000000000000))) // 10^16
     {
-        ++q;
-        constexpr auto ten_p {detail::pow10<int128::uint128_t>(int128::uint128_t{UINT64_C(16)})};
-        if (BOOST_DECIMAL_UNLIKELY(q == ten_p))
-        {
-            q = detail::pow10<int128::uint128_t>(int128::uint128_t{UINT64_C(15)});
-            ++extra;
-        }
+        q = UINT64_C(1000000000000000); // 10^15
+        ++extra;
     }
 
-    return detail::pack_in_range<ReturnType>(q.low,
+    return detail::pack_in_range<ReturnType>(q,
                                              result_exp + static_cast<ExpType>(extra),
                                              result_sign);
 }
@@ -117,7 +115,8 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u128(
 // u256 product -> decimal{128,fast128}_t. Product spans [10^66, ~10^68).
 template <typename ReturnType, typename ExpType>
 BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u256(
-    const u256& product, ExpType result_exp, bool result_sign) noexcept -> ReturnType
+    const u256& product, ExpType result_exp, bool result_sign,
+    const rounding_mode round = rounding_mode::fe_dec_to_nearest) noexcept -> ReturnType
 {
     int extra {33};
     if (product >= detail::pow10(u256{UINT64_C(67)}))
@@ -163,16 +162,15 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u256(
     const int128::uint128_t remainder {(pow5_remainder << extra) | int128::uint128_t{product.bytes[0] & ((UINT64_C(1) << extra) - 1U)}};
     const int128::uint128_t half {pow5 << (extra - 1)};
 
-    if (remainder > half || (remainder == half && (quotient.low & UINT64_C(1)) != 0U))
+    const bool round_up {round == rounding_mode::fe_dec_to_nearest ? remainder + (quotient.low & UINT64_C(1)) > half :
+                                                                     detail::steps_up_in_mode(round, result_sign, remainder != 0U, remainder >= half)};
+    quotient += static_cast<unsigned>(round_up);
+    // ten_p: 10^34, one more than the largest 34-digit significand
+    constexpr int128::uint128_t ten_p {UINT64_C(0x1ED09BEAD87C0), UINT64_C(0x378D8E6400000000)};
+    if (BOOST_DECIMAL_UNLIKELY(quotient == ten_p))
     {
-        ++quotient;
-        // ten_p: 10^34, one more than the largest 34-digit significand
-        constexpr int128::uint128_t ten_p {UINT64_C(0x1ED09BEAD87C0), UINT64_C(0x378D8E6400000000)};
-        if (BOOST_DECIMAL_UNLIKELY(quotient == ten_p))
-        {
-            quotient = detail::pow10(int128::uint128_t{UINT64_C(33)});
-            ++extra;
-        }
+        quotient = detail::pow10(int128::uint128_t{UINT64_C(33)});
+        ++extra;
     }
 
     return detail::pack_in_range<ReturnType>(quotient,
@@ -180,11 +178,33 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u256(
                                              result_sign);
 }
 
+// Out-of-line helpers for the directed modes, without FORCE_INLINE: an inlined
+// second copy of a finalizer makes the operators slower in the nearest mode.
+template <typename ReturnType, typename ExpType>
+BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u64_out_of_line(
+    std::uint_fast64_t product, ExpType result_exp, bool result_sign, const rounding_mode round) noexcept -> ReturnType
+{
+    return mul_finalize_u64<ReturnType>(product, result_exp, result_sign, round);
+}
+
+template <typename ReturnType, typename ExpType>
+BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u128_out_of_line(
+    int128::uint128_t product, ExpType result_exp, bool result_sign, const rounding_mode round) noexcept -> ReturnType
+{
+    return mul_finalize_u128<ReturnType>(product, result_exp, result_sign, round);
+}
+
+template <typename ReturnType, typename ExpType>
+BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_finalize_u256_out_of_line(
+    const u256& product, ExpType result_exp, bool result_sign, const rounding_mode round) noexcept -> ReturnType
+{
+    return mul_finalize_u256<ReturnType>(product, result_exp, result_sign, round);
+}
+
 // Default-rounding gate matching add_impl's pattern: check the global rounding
 // mode at compile-time and runtime; the fast path is only safe when the active
 // mode is fe_dec_to_nearest (the round-half-to-even logic in mul_finalize_*).
-// For any other mode, callers fall back to the constructor (which dispatches
-// to fenv_round, honoring the runtime mode correctly).
+// For any other mode, callers use the out-of-line helpers above.
 template <typename Anchor>
 BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_default_rounding(const Anchor& anchor) noexcept -> bool
 {
@@ -238,8 +258,12 @@ namespace impl {
 
 template <typename ReturnType, std::int32_t TVal, typename Components>
 BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_impl_dispatch(
-    Components lhs_c, Components rhs_c, std::true_type /*is_decimal_floating_point*/) noexcept -> ReturnType
+    const Components& lhs_in, const Components& rhs_in, std::true_type /*is_decimal_floating_point*/) noexcept -> ReturnType
 {
+    // Expand local copies: MSVC 14.2 in C++14 mode multiplied the lhs
+    // significand of a by-value parameter from before expand_significand.
+    auto lhs_c {lhs_in};
+    auto rhs_c {rhs_in};
     using mul_type = std::conditional_t<TVal < 64, std::uint_fast64_t, int128::uint128_t>;
     const bool sign {lhs_c.sign != rhs_c.sign};
 
@@ -292,14 +316,12 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_impl_dispatch(
         {
             return ReturnType{res_sig, res_exp, sign};
         }
-        if (BOOST_DECIMAL_UNLIKELY(!impl::mul_default_rounding(lhs_c.sig)))
-        {
-            // Non-default rounding mode: constructor's coefficient_rounding
-            // dispatches to fenv_round which honors the runtime mode.
-            return ReturnType{res_sig, res_exp, sign};
-        }
         BOOST_DECIMAL_IF_CONSTEXPR (TVal < 64)
         {
+            if (BOOST_DECIMAL_UNLIKELY(!impl::mul_default_rounding(lhs_c.sig)))
+            {
+                return impl::mul_finalize_u64_out_of_line<ReturnType>(static_cast<std::uint_fast64_t>(res_sig), res_exp, sign, detail::current_rounding_mode());
+            }
             // The static_cast is identity in this branch (mul_type is uint_fast64_t
             // when TVal < 64) but is required to make the d64/d128 instantiation
             // type-check in C++14, where BOOST_DECIMAL_IF_CONSTEXPR is plain `if`
@@ -309,6 +331,10 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_impl_dispatch(
         }
         else
         {
+            if (BOOST_DECIMAL_UNLIKELY(!impl::mul_default_rounding(lhs_c.sig)))
+            {
+                return impl::mul_finalize_u128_out_of_line<ReturnType>(res_sig, res_exp, sign, detail::current_rounding_mode());
+            }
             return impl::mul_finalize_u128<ReturnType>(res_sig, res_exp, sign);
         }
     }
@@ -385,7 +411,7 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto mul_impl(T lhs_sig,
     }
     if (BOOST_DECIMAL_UNLIKELY(!impl::mul_default_rounding(lhs_sig)))
     {
-        return ReturnType{res_sig, res_exp, sign};
+        return impl::mul_finalize_u64_out_of_line<ReturnType>(res_sig, res_exp, sign, detail::current_rounding_mode());
     }
 
     return impl::mul_finalize_u64<ReturnType>(res_sig, res_exp, sign);
@@ -420,7 +446,7 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto d64_mul_impl(const 
     }
     if (BOOST_DECIMAL_UNLIKELY(!impl::mul_default_rounding(lhs)))
     {
-        return ReturnType{res_sig, res_exp, sign};
+        return impl::mul_finalize_u128_out_of_line<ReturnType>(res_sig, res_exp, sign, detail::current_rounding_mode());
     }
 
     return impl::mul_finalize_u128<ReturnType>(res_sig, res_exp, sign);
@@ -450,7 +476,7 @@ BOOST_DECIMAL_FORCE_INLINE BOOST_DECIMAL_CUDA_CONSTEXPR auto d64_mul_impl(T lhs_
     }
     if (BOOST_DECIMAL_UNLIKELY(!impl::mul_default_rounding(lhs_sig)))
     {
-        return ReturnType{res_sig, res_exp, sign};
+        return impl::mul_finalize_u128_out_of_line<ReturnType>(res_sig, res_exp, sign, detail::current_rounding_mode());
     }
 
     return impl::mul_finalize_u128<ReturnType>(res_sig, res_exp, sign);
@@ -535,21 +561,7 @@ BOOST_DECIMAL_CUDA_CONSTEXPR auto d128_mul_impl(const T1& lhs_sig_in, const U1 l
 
     if (BOOST_DECIMAL_UNLIKELY(!impl::mul_default_rounding(lhs_sig)))
     {
-        // Non-default rounding mode: use coefficient_rounding which dispatches
-        // to fenv_round and honors the runtime mode. Pack via pack_in_range so
-        // the in-range case takes direct_pack (no redundant num_digits in the
-        // constructor); out-of-range biased_exp falls back to the constructor.
-        const auto sig_dig {detail::num_digits(res_sig)};
-        const auto digit_delta {sig_dig - std::numeric_limits<sig_type>::digits10};
-        auto res_exp_mut {res_exp};
-
-        if (BOOST_DECIMAL_LIKELY(digit_delta > 0))
-        {
-            auto biased_exp {res_exp_mut + detail::bias_v<ReturnType>};
-            detail::coefficient_rounding<ReturnType>(res_sig, res_exp_mut, biased_exp, sign, sig_dig);
-        }
-
-        return detail::pack_in_range<ReturnType>(int128::uint128_t{res_sig[1], res_sig[0]}, res_exp_mut, sign);
+        return impl::mul_finalize_u256_out_of_line<ReturnType>(res_sig, res_exp, sign, detail::current_rounding_mode());
     }
 
     return impl::mul_finalize_u256<ReturnType>(res_sig, res_exp, sign);
